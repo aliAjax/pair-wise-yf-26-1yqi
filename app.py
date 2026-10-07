@@ -57,6 +57,32 @@ def verify_manifest(files: object) -> list[dict]:
     return result
 
 
+def verify_report_manifest(files: object, state: str) -> list[dict]:
+    """校验保存点上报的文件清单；离线/降级上报允许空清单。"""
+    if files is None:
+        files = []
+    if not isinstance(files, list):
+        raise BusinessError("上报清单必须是数组", 422, "invalid_report")
+    if state == "ok" and not files:
+        raise BusinessError("保存点上报健康时必须提供文件清单", 422, "invalid_report")
+    result, seen = [], set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise BusinessError("上报条目必须是对象", 422, "invalid_report")
+        path = str(item.get("path", "")).strip().replace("\\", "/")
+        sha256 = str(item.get("sha256", "")).strip().lower()
+        size = item.get("size")
+        if not path or path in seen:
+            raise BusinessError("上报清单路径缺失或重复", 422, "invalid_report")
+        seen.add(path)
+        if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+            raise BusinessError(f"{path} 上报的 sha256 不合法", 422, "invalid_report")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise BusinessError(f"{path} 上报的 size 不合法", 422, "invalid_report")
+        result.append({"path": path, "sha256": sha256, "size": size})
+    return result
+
+
 class PreservationStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
@@ -144,6 +170,28 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS storage_points(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sync_tasks(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    location TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','synced')),
+                    reason TEXT NOT NULL DEFAULT 'ingest' CHECK(reason IN ('ingest','migrate','reconcile')),
+                    actor_id TEXT REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS copy_reports(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    copy_id INTEGER NOT NULL REFERENCES copies(id),
+                    state TEXT NOT NULL CHECK(state IN ('ok','offline','degraded')),
+                    files_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -158,6 +206,10 @@ class PreservationStore:
                     ("auditor", "独立审计员", "auditor"),
                     ("outsider", "未授权访客", "auditor"),
                 ],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO storage_points(name,created_at) VALUES(?,?)",
+                [("site-a", now()), ("site-b", now())],
             )
 
     def _user(self, conn, user_id: str | None, roles: set[str] | None = None) -> sqlite3.Row:
@@ -187,6 +239,75 @@ class PreservationStore:
             "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
+
+    def _ensure_storage_point(self, conn, name: str) -> None:
+        conn.execute("INSERT OR IGNORE INTO storage_points(name,created_at) VALUES(?,?)", (name, now()))
+
+    def _open_sync_task(self, conn, version_id: int, location: str, reason: str) -> int:
+        """确保 (版本, 保存点) 存在待办同步任务；已有待办则复用，历史任务不覆盖。"""
+        row = conn.execute(
+            "SELECT id FROM sync_tasks WHERE version_id=? AND location=? AND state='pending'",
+            (version_id, location),
+        ).fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute(
+            "INSERT INTO sync_tasks(version_id,location,state,reason,created_at) VALUES(?,?,'pending',?,?)",
+            (version_id, location, reason, now()),
+        )
+        return cur.lastrowid
+
+    def _sync_tasks_for_all_points(self, conn, version_id: int, reason: str) -> list[int]:
+        """版本入库/迁移后，为每个已登记保存点生成待办同步任务。"""
+        task_ids = []
+        for point in conn.execute("SELECT name FROM storage_points ORDER BY id").fetchall():
+            task_ids.append(self._open_sync_task(conn, version_id, point["name"], reason))
+        return task_ids
+
+    def _refresh_version_state(self, conn, version_id: int) -> None:
+        """版本健康由本地对账结果驱动：存在非健康副本即降级，全部健康则恢复。"""
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM copies WHERE version_id=? AND state<>'healthy'", (version_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE archive_versions SET state=? WHERE id=?", ("verified" if bad == 0 else "degraded", version_id)
+        )
+
+    def _run_sync_task(self, conn, task: sqlite3.Row, actor_id: str) -> dict:
+        """按本地原始清单重新补传副本内容，并关闭待办任务。"""
+        version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (task["version_id"],)).fetchone()
+        files = conn.execute(
+            "SELECT path,sha256,size,content FROM archive_files WHERE version_id=?", (task["version_id"],)
+        ).fetchall()
+        copy = conn.execute(
+            "SELECT * FROM copies WHERE version_id=? AND location=?", (task["version_id"], task["location"])
+        ).fetchone()
+        if copy:
+            copy_id = copy["id"]
+            conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
+        else:
+            copy_id = conn.execute(
+                "INSERT INTO copies(version_id,location,created_at) VALUES(?,?,?)",
+                (task["version_id"], task["location"], now()),
+            ).lastrowid
+        conn.execute(
+            """INSERT INTO copy_files(copy_id,path,sha256,size,content)
+               SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
+            (copy_id, task["version_id"]),
+        )
+        conn.execute("UPDATE copies SET state='healthy' WHERE id=?", (copy_id,))
+        conn.execute(
+            "UPDATE sync_tasks SET state='synced',actor_id=?,finished_at=? WHERE id=?",
+            (actor_id, now(), task["id"]),
+        )
+        self._refresh_version_state(conn, task["version_id"])
+        self._audit(
+            conn, version["archive_id"], actor_id, "sync.run",
+            {"task_id": task["id"], "version_id": task["version_id"], "location": task["location"],
+             "copy_id": copy_id, "files": len(files)},
+        )
+        return {"task_id": task["id"], "copy_id": copy_id, "version_id": task["version_id"],
+                "location": task["location"], "state": "synced", "files": len(files)}
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
         name = name.strip()
@@ -253,10 +374,12 @@ class PreservationStore:
                         "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
                         (version_id, item["path"], item["sha256"], item["size"], item["content"]),
                     )
+                task_ids = self._sync_tasks_for_all_points(conn, version_id, "ingest")
                 self._audit(
                     conn, archive_id, actor_id, "version.ingest",
                     {"version_id": version_id, "version": version_no, "files": len(manifest),
-                     "manifest": [{"path": x["path"], "sha256": x["sha256"], "size": x["size"]} for x in manifest]},
+                     "manifest": [{"path": x["path"], "sha256": x["sha256"], "size": x["size"]} for x in manifest],
+                     "sync_tasks": task_ids},
                 )
                 return {"id": version_id, "archive_id": archive_id, "version": version_no, "file_count": len(manifest)}
             except Exception:
@@ -264,6 +387,7 @@ class PreservationStore:
                 raise
 
     def add_copy(self, actor_id: str, version_id: int, location: str) -> dict:
+        """在指定保存点建立副本：登记保存点、生成同步任务并按本地原始清单立即补传。"""
         location = location.strip()
         if len(location) < 2:
             raise BusinessError("副本位置不能为空", 422, "invalid_location")
@@ -273,23 +397,18 @@ class PreservationStore:
             if not version:
                 raise BusinessError("档案版本不存在", 404, "not_found")
             self._access(conn, version["archive_id"], actor, require_write=True)
+            if conn.execute(
+                "SELECT 1 FROM copies WHERE version_id=? AND location=?", (version_id, location)
+            ).fetchone():
+                raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                cur = conn.execute(
-                    "INSERT INTO copies(version_id,location,created_at,last_verified_at) VALUES(?,?,?,?)",
-                    (version_id, location, now(), now()),
-                )
-                copy_id = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO copy_files(copy_id,path,sha256,size,content)
-                       SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
-                    (copy_id, version_id),
-                )
-                self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
-                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
-            except sqlite3.IntegrityError:
-                conn.rollback()
-                raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
+                self._ensure_storage_point(conn, location)
+                task_id = self._open_sync_task(conn, version_id, location, "ingest")
+                task = conn.execute("SELECT * FROM sync_tasks WHERE id=?", (task_id,)).fetchone()
+                result = self._run_sync_task(conn, task, actor_id)
+                return {"id": result["copy_id"], "version_id": version_id, "location": location,
+                        "state": "healthy", "task_id": task_id}
             except Exception:
                 conn.rollback()
                 raise
@@ -304,63 +423,139 @@ class PreservationStore:
             files = conn.execute(
                 "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
             ).fetchall()
-            copies = conn.execute(
+            copies = []
+            for row in conn.execute(
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
+            ).fetchall():
+                item = dict(row)
+                report = conn.execute(
+                    "SELECT state,created_at FROM copy_reports WHERE copy_id=? ORDER BY id DESC LIMIT 1", (row["id"],)
+                ).fetchone()
+                item["latest_report"] = dict(report) if report else None
+                copies.append(item)
+            sync_tasks = conn.execute(
+                "SELECT id,location,state,reason,actor_id,created_at,finished_at FROM sync_tasks WHERE version_id=? ORDER BY id",
+                (version_id,),
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files],
+                    "copies": copies, "sync_tasks": [dict(x) for x in sync_tasks]}
 
-    def verify_copy(self, user_id: str, copy_id: int) -> dict:
+    def report_copy(self, actor_id: str, copy_id: int, state: str, files: object) -> dict:
+        """保存点单独上报状态与清单；上报只追加不覆盖，健康与否由对账按本地原始清单判定。"""
+        if state not in {"ok", "offline", "degraded"}:
+            raise BusinessError("上报状态必须是 ok、offline 或 degraded", 422, "invalid_report_state")
         with self.connect() as conn:
-            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+            if not copy:
+                raise BusinessError("副本不存在", 404, "not_found")
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+            self._access(conn, version["archive_id"], actor, require_write=True)
+            manifest = verify_report_manifest(files, state)
+            conn.execute(
+                "INSERT INTO copy_reports(copy_id,state,files_json,created_at) VALUES(?,?,?,?)",
+                (copy_id, state, json.dumps(manifest, ensure_ascii=False, sort_keys=True), now()),
+            )
+            self._audit(conn, version["archive_id"], actor_id, "copy.report",
+                        {"copy_id": copy_id, "state": state, "files": len(manifest)})
+            return {"copy_id": copy_id, "state": state, "files": len(manifest)}
+
+    def reconcile_copy(self, actor_id: str, copy_id: int) -> dict:
+        """对账：以本地原始清单为准核对副本实际内容和保存点上报，不轻信上报状态。
+
+        内容对不上 -> corrupt；保存点掉线、缺上报或上报清单对不上 -> degraded；
+        对账失败会生成待办同步任务，供档案管理员重新补传恢复。
+        """
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
                 if not copy:
                     raise BusinessError("副本不存在", 404, "not_found")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
-                self._access(conn, version["archive_id"], user)
-                stored = conn.execute(
-                    "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
-                ).fetchall()
-                corrupt_paths = [r["path"] for r in stored if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]]
-                repaired = False
-                if not corrupt_paths:
+                self._access(conn, version["archive_id"], actor, require_write=True)
+                expected = {
+                    r["path"]: (r["sha256"], r["size"])
+                    for r in conn.execute(
+                        "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
+                    ).fetchall()
+                }
+                stored = {
+                    r["path"]: r
+                    for r in conn.execute(
+                        "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=?", (copy_id,)
+                    ).fetchall()
+                }
+                differences = []
+                for path, (sha256, size) in sorted(expected.items()):
+                    row = stored.get(path)
+                    if row is None:
+                        differences.append({"path": path, "issue": "missing"})
+                    elif hashlib.sha256(row["content"]).hexdigest() != sha256 or len(row["content"]) != size:
+                        differences.append({"path": path, "issue": "content_mismatch"})
+                for path in sorted(stored.keys() - expected.keys()):
+                    differences.append({"path": path, "issue": "unexpected"})
+                report = conn.execute(
+                    "SELECT * FROM copy_reports WHERE copy_id=? ORDER BY id DESC LIMIT 1", (copy_id,)
+                ).fetchone()
+                report_issue, report_differences = None, []
+                if report is None:
+                    report_issue = "no_report"
+                elif report["state"] != "ok":
+                    report_issue = f"point_{report['state']}"
+                else:
+                    reported = {f["path"]: (f["sha256"], f["size"]) for f in json.loads(report["files_json"])}
+                    for path, expect in sorted(expected.items()):
+                        if path not in reported:
+                            report_differences.append({"path": path, "issue": "report_missing"})
+                        elif reported[path] != expect:
+                            report_differences.append({"path": path, "issue": "report_mismatch"})
+                    for path in sorted(reported.keys() - expected.keys()):
+                        report_differences.append({"path": path, "issue": "report_unexpected"})
+                healthy = not differences and report_issue is None and not report_differences
+                task_id = None
+                if healthy:
                     conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
+                    conn.execute(
+                        """UPDATE sync_tasks SET state='synced',actor_id=?,finished_at=?
+                           WHERE version_id=? AND location=? AND state='pending'""",
+                        (actor_id, now(), copy["version_id"], copy["location"]),
+                    )
                     result_state = "healthy"
                 else:
-                    conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), copy_id))
-                    healthy = conn.execute(
-                        "SELECT id FROM copies WHERE version_id=? AND id<>? AND state='healthy' ORDER BY last_verified_at DESC LIMIT 1",
-                        (copy["version_id"], copy_id),
-                    ).fetchone()
-                    result_state = "degraded"
-                    if healthy:
-                        donor = conn.execute(
-                            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (healthy["id"],)
-                        ).fetchall()
-                        donor_by_path = {r["path"]: r for r in donor}
-                        expected = {r["path"]: r for r in conn.execute(
-                            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
-                        ).fetchall()}
-                        if set(donor_by_path) == set(expected) and all(
-                            hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"] for p in expected
-                        ):
-                            conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
-                            conn.execute(
-                                """INSERT INTO copy_files(copy_id,path,sha256,size,content)
-                                   SELECT ?,path,sha256,size,content FROM copy_files WHERE copy_id=?""",
-                                (copy_id, healthy["id"]),
-                            )
-                            conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
-                            repaired, result_state = True, "healthy"
-                    if result_state == "degraded":
-                        conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                    result_state = "corrupt" if differences else "degraded"
+                    conn.execute("UPDATE copies SET state=? WHERE id=?", (result_state, copy_id))
+                    task_id = self._open_sync_task(conn, copy["version_id"], copy["location"], "reconcile")
+                self._refresh_version_state(conn, copy["version_id"])
                 self._audit(
-                    conn, version["archive_id"], user_id, "copy.verify",
-                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
+                    conn, version["archive_id"], actor_id, "copy.reconcile",
+                    {"copy_id": copy_id, "result": result_state, "differences": differences,
+                     "report_issue": report_issue, "report_differences": report_differences,
+                     "sync_task_id": task_id},
                 )
-                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired}
+                return {"copy_id": copy_id, "state": result_state, "differences": differences,
+                        "report_issue": report_issue, "report_differences": report_differences,
+                        "sync_task_id": task_id}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def run_sync_task(self, actor_id: str, task_id: int) -> dict:
+        """从待办恢复：按本地原始清单重新补传副本；审计记录只追加，不覆盖。"""
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                task = conn.execute("SELECT * FROM sync_tasks WHERE id=?", (task_id,)).fetchone()
+                if not task:
+                    raise BusinessError("同步任务不存在", 404, "not_found")
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (task["version_id"],)).fetchone()
+                self._access(conn, version["archive_id"], actor, require_write=True)
+                if task["state"] != "pending":
+                    raise BusinessError("同步任务已完成，不能重复补传", 409, "task_already_done")
+                return self._run_sync_task(conn, task, actor_id)
             except Exception:
                 conn.rollback()
                 raise
@@ -420,10 +615,12 @@ class PreservationStore:
                     "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
                     (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
                 )
+                task_ids = self._sync_tasks_for_all_points(conn, target_version_id, "migrate")
                 self._audit(
                     conn, source_version["archive_id"], actor_id, "format.migrate",
                     {"source_version_id": version_id, "target_version_id": target_version_id,
-                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
+                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip(),
+                     "sync_tasks": task_ids},
                 )
                 return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
             except Exception:
@@ -437,12 +634,35 @@ class PreservationStore:
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             versions = conn.execute("SELECT id,version,state,created_at FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)).fetchall()
             deadline = date.fromisoformat(archive["retention_until"])
+            version_items = []
+            for v in versions:
+                copies = []
+                for c in conn.execute(
+                    "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (v["id"],)
+                ).fetchall():
+                    item = dict(c)
+                    report = conn.execute(
+                        "SELECT state FROM copy_reports WHERE copy_id=? ORDER BY id DESC LIMIT 1", (c["id"],)
+                    ).fetchone()
+                    item["latest_report_state"] = report["state"] if report else None
+                    copies.append(item)
+                version_items.append(
+                    dict(v) | {
+                        "file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
+                        "copy_count": len(copies),
+                        "copies": copies,
+                        "sync_tasks": [
+                            dict(t) for t in conn.execute(
+                                "SELECT id,location,state,reason,actor_id,created_at,finished_at FROM sync_tasks WHERE version_id=? ORDER BY id",
+                                (v["id"],),
+                            ).fetchall()
+                        ],
+                    }
+                )
             return {
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
-                "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
-                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
-                             for v in versions],
+                "versions": version_items,
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
 
@@ -507,8 +727,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "migrate" and method == "POST":
             d = self._body()
             return self._send(201, store.migrate(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", "")))
-        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "verify" and method == "POST":
-            return self._send(200, store.verify_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "reconcile" and method == "POST":
+            return self._send(200, store.reconcile_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "report" and method == "POST":
+            d = self._body()
+            return self._send(200, store.report_copy(user, int(parts[2]), d.get("state", ""), d.get("files")))
+        if len(parts) == 4 and parts[:2] == ["api", "sync-tasks"] and parts[3] == "run" and method == "POST":
+            return self._send(200, store.run_sync_task(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
