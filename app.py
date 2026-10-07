@@ -114,6 +114,8 @@ class PreservationStore:
                     version_id INTEGER NOT NULL REFERENCES archive_versions(id),
                     location TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','degraded')),
+                    reported_state TEXT CHECK(reported_state IN ('online','offline')),
+                    reported_at TEXT,
                     created_at TEXT NOT NULL,
                     last_verified_at TEXT,
                     UNIQUE(version_id,location)
@@ -125,6 +127,29 @@ class PreservationStore:
                     size INTEGER NOT NULL,
                     content BLOB NOT NULL,
                     PRIMARY KEY(copy_id,path)
+                );
+                CREATE TABLE IF NOT EXISTS sync_tasks(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    copy_id INTEGER REFERENCES copies(id),
+                    location TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','synced','mismatch')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(version_id,location)
+                );
+                CREATE TABLE IF NOT EXISTS recovery_backlog(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    copy_id INTEGER NOT NULL REFERENCES copies(id),
+                    reason TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','resolved')),
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by TEXT REFERENCES users(id)
                 );
                 CREATE TABLE IF NOT EXISTS migrations(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +171,11 @@ class PreservationStore:
                 );
                 """
             )
+            # 兼容旧库：为 copies 补充保存点上报状态字段
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(copies)").fetchall()}
+            for column in ("reported_state", "reported_at"):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE copies ADD COLUMN {column} TEXT")
 
     def seed(self) -> None:
         self.init_schema()
@@ -187,6 +217,217 @@ class PreservationStore:
             "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
+
+    def _create_sync_tasks(self, conn, archive_id: int, version_id: int) -> None:
+        """版本入库或迁移后，为该档案已有保存点生成同步任务（待对账）。"""
+        locations = [
+            r["location"]
+            for r in conn.execute(
+                """SELECT DISTINCT c.location FROM copies c
+                   JOIN archive_versions v ON v.id=c.version_id
+                   WHERE v.archive_id=? ORDER BY c.location""",
+                (archive_id,),
+            ).fetchall()
+        ]
+        for loc in locations:
+            conn.execute(
+                """INSERT INTO sync_tasks(archive_id,version_id,copy_id,location,state,created_at,updated_at)
+                   VALUES(?,?,NULL,?,'pending',?,?)
+                   ON CONFLICT(version_id,location) DO NOTHING""",
+                (archive_id, version_id, loc, now(), now()),
+            )
+
+    def _copy_health(self, conn, copy_id: int, version_id: int) -> tuple[list[str], list[str]]:
+        """按本地原始清单核对副本，返回 (损坏/缺失路径, 多余路径)。
+
+        健康以服务端持有的原始清单 archive_files 为准重新计算，
+        不信任保存点上报，也不采纳副本自身记录的哈希。
+        """
+        manifest = conn.execute(
+            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (version_id,)
+        ).fetchall()
+        stored = conn.execute(
+            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=?", (copy_id,)
+        ).fetchall()
+        expected = {r["path"]: r for r in manifest}
+        actual = {r["path"]: r for r in stored}
+        corrupt = [
+            p for p, exp in expected.items()
+            if (got := actual.get(p)) is None
+            or len(got["content"]) != exp["size"]
+            or hashlib.sha256(got["content"]).hexdigest() != exp["sha256"]
+        ]
+        extra = [p for p in actual if p not in expected]
+        return corrupt, extra
+
+    def _refresh_version_state(self, conn, version_id: int) -> str:
+        bad_copies = conn.execute(
+            "SELECT COUNT(*) AS n FROM copies WHERE version_id=? AND state<>'healthy'", (version_id,)
+        ).fetchone()["n"]
+        bad_tasks = conn.execute(
+            "SELECT COUNT(*) AS n FROM sync_tasks WHERE version_id=? AND state='mismatch'", (version_id,)
+        ).fetchone()["n"]
+        state = "degraded" if bad_copies or bad_tasks else "verified"
+        conn.execute("UPDATE archive_versions SET state=? WHERE id=?", (state, version_id))
+        return state
+
+    def _ensure_backlog(self, conn, version: sqlite3.Row, copy: sqlite3.Row, detail: dict) -> None:
+        """对账失败后登记待办；同一副本同一原因只保留一条未完成项，恢复后关闭。"""
+        open_item = conn.execute(
+            "SELECT id FROM recovery_backlog WHERE copy_id=? AND state='open' AND reason='sync_mismatch'",
+            (copy["id"],),
+        ).fetchone()
+        if not open_item:
+            conn.execute(
+                """INSERT INTO recovery_backlog(archive_id,version_id,copy_id,reason,state,detail,created_at)
+                   VALUES(?,?,?,'sync_mismatch','open',?,?)""",
+                (version["archive_id"], version["id"], copy["id"],
+                 json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
+            )
+
+    def _reconcile_copy(self, conn, actor_id: str, copy: sqlite3.Row) -> dict:
+        """对账单个副本：以本地原始清单为准，更新副本/同步任务/待办并追加审计。
+
+        调用方负责事务与权限；审计只追加，绝不覆盖既有记录。
+        """
+        version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+        corrupt, extra = self._copy_health(conn, copy["id"], version["id"])
+        healthy = not corrupt and not extra
+        if healthy:
+            conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy["id"]))
+            conn.execute(
+                """UPDATE sync_tasks SET state='synced',updated_at=?,copy_id=COALESCE(copy_id,?)
+                   WHERE version_id=? AND location=?""",
+                (now(), copy["id"], version["id"], copy["location"]),
+            )
+            result_state = "healthy"
+        else:
+            conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), copy["id"]))
+            conn.execute(
+                """UPDATE sync_tasks SET state='mismatch',updated_at=?,copy_id=COALESCE(copy_id,?)
+                   WHERE version_id=? AND location=?""",
+                (now(), copy["id"], version["id"], copy["location"]),
+            )
+            self._ensure_backlog(conn, version, copy, {"corrupt_paths": corrupt, "extra_paths": extra})
+            result_state = "corrupt"
+        version_state = self._refresh_version_state(conn, version["id"])
+        self._audit(
+            conn, version["archive_id"], actor_id, "copy.reconcile",
+            {"copy_id": copy["id"], "location": copy["location"], "state": result_state,
+             "corrupt_paths": corrupt, "extra_paths": extra},
+        )
+        return {"copy_id": copy["id"], "location": copy["location"], "state": result_state,
+                "corrupt_paths": corrupt, "extra_paths": extra, "version_state": version_state}
+
+    def report_copy(self, user_id: str, copy_id: int, state: str) -> dict:
+        """保存点单独上报在线/离线状态；上报不决定健康，健康只能来自对账。"""
+        state = (state or "").strip().lower()
+        if state not in ("online", "offline"):
+            raise BusinessError("上报状态必须是 online 或 offline", 422, "invalid_report")
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist"})
+            copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+            if not copy:
+                raise BusinessError("副本不存在", 404, "not_found")
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+            self._access(conn, version["archive_id"], user, require_write=True)
+            conn.execute("UPDATE copies SET reported_state=?,reported_at=? WHERE id=?", (state, now(), copy_id))
+            if state == "offline":
+                conn.execute("UPDATE copies SET state='degraded' WHERE id=?", (copy_id,))
+                self._refresh_version_state(conn, version["id"])
+            self._audit(
+                conn, version["archive_id"], user_id, "copy.report",
+                {"copy_id": copy_id, "location": copy["location"], "reported_state": state},
+            )
+            return {"copy_id": copy_id, "location": copy["location"], "reported_state": state}
+
+    def reconcile_copy(self, user_id: str, copy_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+                if not copy:
+                    raise BusinessError("副本不存在", 404, "not_found")
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+                self._access(conn, version["archive_id"], user, require_write=True)
+                return self._reconcile_copy(conn, user_id, copy)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def reconcile_version(self, user_id: str, version_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
+                if not version:
+                    raise BusinessError("档案版本不存在", 404, "not_found")
+                self._access(conn, version["archive_id"], user, require_write=True)
+                copies = conn.execute("SELECT * FROM copies WHERE version_id=? ORDER BY id", (version_id,)).fetchall()
+                results = [self._reconcile_copy(conn, user_id, c) for c in copies]
+                version_state = conn.execute("SELECT state FROM archive_versions WHERE id=?", (version_id,)).fetchone()["state"]
+                return {"version_id": version_id, "state": version_state, "results": results}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def recover_copy(self, user_id: str, copy_id: int) -> dict:
+        """从待办恢复：以本地原始清单重新补传副本内容，关闭待办并追加审计。
+
+        补传只重写副本内容与同步任务状态，绝不覆盖历史审计记录。
+        """
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+                if not copy:
+                    raise BusinessError("副本不存在", 404, "not_found")
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+                self._access(conn, version["archive_id"], user, require_write=True)
+                manifest = conn.execute(
+                    "SELECT path,sha256,size,content FROM archive_files WHERE version_id=? ORDER BY path",
+                    (version["id"],),
+                ).fetchall()
+                conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
+                for m in manifest:
+                    conn.execute(
+                        "INSERT INTO copy_files(copy_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (copy_id, m["path"], m["sha256"], m["size"], m["content"]),
+                    )
+                conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
+                conn.execute(
+                    """UPDATE sync_tasks SET state='synced',updated_at=?,copy_id=?
+                       WHERE version_id=? AND location=?""",
+                    (now(), copy_id, version["id"], copy["location"]),
+                )
+                resolved = conn.execute(
+                    """UPDATE recovery_backlog SET state='resolved',resolved_at=?,resolved_by=?
+                       WHERE copy_id=? AND state='open' AND reason='sync_mismatch'""",
+                    (now(), user_id, copy_id),
+                )
+                self._refresh_version_state(conn, version["id"])
+                self._audit(
+                    conn, version["archive_id"], user_id, "copy.recover",
+                    {"copy_id": copy_id, "location": copy["location"],
+                     "files": len(manifest), "resolved_backlog": resolved.rowcount},
+                )
+                return {"copy_id": copy_id, "location": copy["location"],
+                        "state": "healthy", "files": len(manifest), "recovered": True}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def backlog(self, user_id: str, archive_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            self._access(conn, archive_id, user)
+            items = conn.execute(
+                "SELECT * FROM recovery_backlog WHERE archive_id=? ORDER BY id", (archive_id,)
+            ).fetchall()
+            return [dict(i) | {"detail": json.loads(i["detail"])} for i in items]
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
         name = name.strip()
@@ -258,6 +499,7 @@ class PreservationStore:
                     {"version_id": version_id, "version": version_no, "files": len(manifest),
                      "manifest": [{"path": x["path"], "sha256": x["sha256"], "size": x["size"]} for x in manifest]},
                 )
+                self._create_sync_tasks(conn, archive_id, version_id)
                 return {"id": version_id, "archive_id": archive_id, "version": version_no, "file_count": len(manifest)}
             except Exception:
                 conn.rollback()
@@ -285,6 +527,13 @@ class PreservationStore:
                        SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
                     (copy_id, version_id),
                 )
+                conn.execute(
+                    """INSERT INTO sync_tasks(archive_id,version_id,copy_id,location,state,created_at,updated_at)
+                       VALUES(?,?,?,?,'pending',?,?)
+                       ON CONFLICT(version_id,location) DO UPDATE SET
+                         copy_id=excluded.copy_id, updated_at=excluded.updated_at""",
+                    (version["archive_id"], version_id, copy_id, location, now(), now()),
+                )
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
                 return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
             except sqlite3.IntegrityError:
@@ -305,10 +554,16 @@ class PreservationStore:
                 "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
             ).fetchall()
             copies = conn.execute(
-                "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
+                """SELECT id,location,state,reported_state,reported_at,last_verified_at
+                   FROM copies WHERE version_id=? ORDER BY id""", (version_id,)
+            ).fetchall()
+            sync_tasks = conn.execute(
+                "SELECT id,copy_id,location,state,created_at,updated_at FROM sync_tasks WHERE version_id=? ORDER BY id",
+                (version_id,),
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files],
+                    "copies": [dict(x) for x in copies], "sync_tasks": [dict(x) for x in sync_tasks]}
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
         with self.connect() as conn:
@@ -320,16 +575,24 @@ class PreservationStore:
                     raise BusinessError("副本不存在", 404, "not_found")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
                 self._access(conn, version["archive_id"], user)
-                stored = conn.execute(
-                    "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
-                ).fetchall()
-                corrupt_paths = [r["path"] for r in stored if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]]
+                # 健康以本地原始清单为准重新计算，不信任保存点上报或副本自身记录
+                corrupt_paths, extra_paths = self._copy_health(conn, copy_id, copy["version_id"])
                 repaired = False
-                if not corrupt_paths:
+                if not corrupt_paths and not extra_paths:
                     conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
+                    conn.execute(
+                        """UPDATE sync_tasks SET state='synced',updated_at=?,copy_id=COALESCE(copy_id,?)
+                           WHERE version_id=? AND location=?""",
+                        (now(), copy_id, copy["version_id"], copy["location"]),
+                    )
                     result_state = "healthy"
                 else:
                     conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), copy_id))
+                    conn.execute(
+                        """UPDATE sync_tasks SET state='mismatch',updated_at=?,copy_id=COALESCE(copy_id,?)
+                           WHERE version_id=? AND location=?""",
+                        (now(), copy_id, copy["version_id"], copy["location"]),
+                    )
                     healthy = conn.execute(
                         "SELECT id FROM copies WHERE version_id=? AND id<>? AND state='healthy' ORDER BY last_verified_at DESC LIMIT 1",
                         (copy["version_id"], copy_id),
@@ -353,14 +616,25 @@ class PreservationStore:
                                 (copy_id, healthy["id"]),
                             )
                             conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
+                            conn.execute(
+                                """UPDATE sync_tasks SET state='synced',updated_at=?,copy_id=?
+                                   WHERE version_id=? AND location=?""",
+                                (now(), copy_id, copy["version_id"], copy["location"]),
+                            )
                             repaired, result_state = True, "healthy"
                     if result_state == "degraded":
-                        conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                        self._ensure_backlog(
+                            conn, version, copy,
+                            {"corrupt_paths": corrupt_paths, "extra_paths": extra_paths, "via": "verify"},
+                        )
+                        self._refresh_version_state(conn, copy["version_id"])
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
-                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
+                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths,
+                     "extra_paths": extra_paths, "repaired": repaired},
                 )
-                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired}
+                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths,
+                        "extra_paths": extra_paths, "repaired": repaired}
             except Exception:
                 conn.rollback()
                 raise
@@ -425,6 +699,7 @@ class PreservationStore:
                     {"source_version_id": version_id, "target_version_id": target_version_id,
                      "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
                 )
+                self._create_sync_tasks(conn, source_version["archive_id"], target_version_id)
                 return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
             except Exception:
                 conn.rollback()
@@ -509,6 +784,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(201, store.migrate(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", "")))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "verify" and method == "POST":
             return self._send(200, store.verify_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "report" and method == "POST":
+            d = self._body()
+            return self._send(200, store.report_copy(user, int(parts[2]), d.get("state", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "reconcile" and method == "POST":
+            return self._send(200, store.reconcile_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "recover" and method == "POST":
+            return self._send(200, store.recover_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "reconcile" and method == "POST":
+            return self._send(200, store.reconcile_version(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "backlog" and method == "GET":
+            return self._send(200, store.backlog(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
